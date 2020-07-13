@@ -1,0 +1,117 @@
+#!/usr/bin/perl
+
+use warnings;
+use strict;
+
+use Net::Pcap;
+use Net::PcapUtils;
+use Data::Dumper;
+use Getopt::Long;
+use POSIX qw(WNOHANG);
+use Sys::Virt;
+use XML::LibXML;
+
+my ($HELP, $DEBUG, $VERBOSE);
+$VERBOSE = 1 if $ENV{TERM};
+GetOptions(
+    help => \$HELP
+    ,debug => \$DEBUG
+    ,verbose => \$VERBOSE
+) or exit;
+
+if ($HELP) {
+    print "$0 [--help] [--verbose] [--debug]\n";
+    exit;
+}
+
+$,=' ';
+
+my $CONNECTION;
+my %PIDS;
+my %DOMAIN;
+
+sub process_packet {
+    my($user_data, $header, $packet) = @_;
+    my $len = length $packet;
+
+    my ($mac) = substr($packet,48,6);
+    my @mac = unpack ('H2'x6, $mac);
+    warn Dumper(\@mac, $header,$user_data) if $DEBUG;
+
+    connect_libvirt();
+    my $domain = search_domain(join(":",@mac)) or return;
+
+    print "Starting ".$domain->get_name."\n";
+    $domain->create();
+
+    connect_libvirt();
+}
+
+sub connect_libvirt {
+    return $CONNECTION if $CONNECTION && $CONNECTION->is_alive();
+
+    $CONNECTION = Sys::Virt->new(uri => 'qemu:///system');
+    return $CONNECTION;
+}
+
+sub disconnect_libvirt {
+    $CONNECTION = undef;
+}
+
+sub search_domain {
+    my $mac = shift;
+    my $conn = connect_libvirt();
+    for my $domain ($conn->list_all_domains()) {
+        next if exists $DOMAIN{$domain->get_name};
+        my $doc = XML::LibXML->load_xml(string => $domain->get_xml_description);
+        for my $doc_mac ( $doc->findnodes("/domain/devices/interface/mac")) {
+            my $dom_mac = $doc_mac->getAttribute('address');
+            return $domain if lc($dom_mac) eq lc($mac);
+        }
+    }
+}
+
+sub listen_udp {
+    my $if = shift;
+
+    my $pid = fork();
+    die "I can't fork" if !defined $pid;
+
+    if ($pid == 0 ) {
+        my $error = Net::PcapUtils::loop(\&process_packet,
+            NUMPACKETS => 1,
+            DEV => $if,
+            FILTER => 'udp port 9',
+            TIMEOUT => 1000
+        );
+        die $error if $error;
+        exit;
+    }
+    $PIDS{$pid} = $if;
+}
+
+my %devinfo;
+my $error;
+my @interfaces = Net::Pcap::findalldevs(\%devinfo, \$error);
+foreach my $if (@interfaces) {
+    next if $if eq 'any';
+    next if $devinfo{$if} =~ /bluetooth|Loopback|netfilter/i;
+    my ($net, $mask, $err);
+    next if Net::Pcap::pcap_lookupnet($if , \$net, \$mask, \ $err);
+
+    print " Listening on interface: " . $if . "\n    Devinfo: " . $devinfo{$if} . "\n"
+    if $VERBOSE;
+
+    listen_udp($if);
+}
+
+
+for (;;) {
+    for my $pid (keys %PIDS) {
+        next if !$PIDS{$pid};
+        my $kid = waitpid(-1, WNOHANG);
+        next if !$kid;
+        listen_udp(delete $PIDS{$kid});
+    }
+    sleep 1;
+}
